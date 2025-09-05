@@ -11,9 +11,10 @@ from face_rt import FaceWorker
 class FrameItem:
     fid: int
     img: np.ndarray
+    timestamp: float = 0.0
 
 
-def draw_overlays(frame: np.ndarray, yolo_dets, face_dets):
+def draw_overlays(frame: np.ndarray, yolo_dets, face_dets, yolo_latency=0.0, face_latency=0.0, total_latency=0.0):
     # YOLO: orange boxes
     if yolo_dets:
         for d in yolo_dets:
@@ -28,6 +29,17 @@ def draw_overlays(frame: np.ndarray, yolo_dets, face_dets):
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
             for (px, py) in f.get("kps", []) or []:
                 cv2.circle(frame, (int(px), int(py)), 2, (0,255,0), -1)
+    
+    # Draw latency information on top-left corner
+    h, w = frame.shape[:2]
+    y_offset = 30
+    cv2.putText(frame, f"YOLO: {yolo_latency*1000:.1f}ms", (10, y_offset), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 180, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"Face: {face_latency*1000:.1f}ms", (10, y_offset + 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"Total: {total_latency*1000:.1f}ms", (10, y_offset + 60), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+    
     return frame
 
 
@@ -92,8 +104,8 @@ def run():
     yolo_in: queue.Queue[FrameItem] = queue.Queue(maxsize=1)
     face_in: queue.Queue[FrameItem] = queue.Queue(maxsize=1)
 
-    latest_yolo = {"fid": -1, "dets": []}
-    latest_face = {"fid": -1, "dets": []}
+    latest_yolo = {"fid": -1, "dets": [], "latency": 0.0}
+    latest_face = {"fid": -1, "dets": [], "latency": 0.0}
     stop_flag = threading.Event()
 
     def capture_loop():
@@ -103,11 +115,12 @@ def run():
             if not ok:
                 time.sleep(0.005); continue
             fid += 1
+            timestamp = time.time()
             # copy once for display/compose
-            _safe_put(disp_q, FrameItem(fid=fid, img=frame.copy()))
+            _safe_put(disp_q, FrameItem(fid=fid, img=frame.copy(), timestamp=timestamp))
             # send to workers (copy to avoid concurrent writes)
-            _safe_put(yolo_in, FrameItem(fid=fid, img=frame.copy()))
-            _safe_put(face_in, FrameItem(fid=fid, img=frame))  # face can share last copy
+            _safe_put(yolo_in, FrameItem(fid=fid, img=frame.copy(), timestamp=timestamp))
+            _safe_put(face_in, FrameItem(fid=fid, img=frame, timestamp=timestamp))  # face can share last copy
 
     def yolo_loop():
         while not stop_flag.is_set():
@@ -115,9 +128,12 @@ def run():
                 item = yolo_in.get(timeout=0.1)
             except queue.Empty:
                 continue
+            start_time = time.time()
             dets = yolo_worker.infer(item.img)
+            latency = time.time() - start_time
             latest_yolo["fid"] = item.fid
             latest_yolo["dets"] = dets
+            latest_yolo["latency"] = latency
 
     def face_loop():
         while not stop_flag.is_set():
@@ -125,9 +141,12 @@ def run():
                 item = face_in.get(timeout=0.1)
             except queue.Empty:
                 continue
+            start_time = time.time()
             dets = face_worker.infer(item.img)
+            latency = time.time() - start_time
             latest_face["fid"] = item.fid
             latest_face["dets"] = dets
+            latest_face["latency"] = latency
 
     def compose_loop():
         n = 0
@@ -138,8 +157,14 @@ def run():
             except queue.Empty:
                 continue
             frame = item.img
+            
+            # Calculate total end-to-end latency
+            current_time = time.time()
+            total_latency = current_time - item.timestamp
+            
             # Use most recent results (asynchronous). It's okay if fids don't match exactly.
-            frame = draw_overlays(frame, latest_yolo["dets"], latest_face["dets"])
+            frame = draw_overlays(frame, latest_yolo["dets"], latest_face["dets"], 
+                                latest_yolo["latency"], latest_face["latency"], total_latency)
 
             if writer:
                 writer.write(frame)
@@ -154,7 +179,10 @@ def run():
                 fps = n / max(1e-6, (time.time() - t0))
                 dy = item.fid - latest_yolo["fid"]
                 df = item.fid - latest_face["fid"]
-                print(f"[{n:6d}] FPS={fps:5.1f} | lag(yolo={dy}, face={df})", file=sys.stderr)
+                yolo_lat_ms = latest_yolo["latency"] * 1000
+                face_lat_ms = latest_face["latency"] * 1000
+                total_lat_ms = total_latency * 1000
+                print(f"[{n:6d}] FPS={fps:5.1f} | lag(yolo={dy}, face={df}) | latency(yolo={yolo_lat_ms:.1f}ms, face={face_lat_ms:.1f}ms, total={total_lat_ms:.1f}ms)", file=sys.stderr)
 
     th_cap = threading.Thread(target=capture_loop, daemon=True)
     th_yolo = threading.Thread(target=yolo_loop, daemon=True)
