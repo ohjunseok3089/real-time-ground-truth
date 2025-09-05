@@ -22,13 +22,18 @@ def draw_overlays(frame: np.ndarray, yolo_dets, face_dets, yolo_latency=0.0, fac
             label = f"{d['cls']} {d['conf']:.2f}"
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 180, 255), 2)
             cv2.putText(frame, label, (x1, max(0, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,180,255), 1, cv2.LINE_AA)
-    # Faces: green boxes + landmarks
+    # Faces: green boxes + landmarks + person ID
     if face_dets:
         for f in face_dets:
             x1, y1, x2, y2 = f["bbox"]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
             for (px, py) in f.get("kps", []) or []:
                 cv2.circle(frame, (int(px), int(py)), 2, (0,255,0), -1)
+            # Draw person ID if available
+            person_id = f.get("person_id")
+            if person_id:
+                cv2.putText(frame, person_id, (x1, max(0, y1-10)), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
     
     # Draw latency information on top-left corner
     h, w = frame.shape[:2]
@@ -37,7 +42,7 @@ def draw_overlays(frame: np.ndarray, yolo_dets, face_dets, yolo_latency=0.0, fac
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 180, 255), 2, cv2.LINE_AA)
     cv2.putText(frame, f"Face: {face_latency*1000:.1f}ms", (10, y_offset + 30), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(frame, f"Total: {total_latency*1000:.1f}ms", (10, y_offset + 60), 
+    cv2.putText(frame, f"E2E: {total_latency*1000:.1f}ms", (10, y_offset + 60), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     
     return frame
@@ -98,14 +103,19 @@ def run():
 
     # Workers
     yolo_worker = YoloWorker(weights=args.weights, use_gpu=constants.USE_GPU)
-    face_worker = FaceWorker(use_gpu=constants.USE_GPU)
+    face_worker = FaceWorker(
+        use_gpu=constants.USE_GPU,
+        enable_person_recognition=getattr(constants, "ENABLE_PERSON_RECOGNITION", False),
+        recognition_threshold=getattr(constants, "RECOGNITION_THRESHOLD", 0.6),
+        max_embeddings=getattr(constants, "MAX_EMBEDDINGS", 36000),
+    )
 
     disp_q: queue.Queue[FrameItem] = queue.Queue(maxsize=2)
     yolo_in: queue.Queue[FrameItem] = queue.Queue(maxsize=1)
     face_in: queue.Queue[FrameItem] = queue.Queue(maxsize=1)
 
-    latest_yolo = {"fid": -1, "dets": [], "latency": 0.0}
-    latest_face = {"fid": -1, "dets": [], "latency": 0.0}
+    latest_yolo = {"fid": -1, "dets": [], "latency": 0.0, "timestamp": 0.0}
+    latest_face = {"fid": -1, "dets": [], "latency": 0.0, "timestamp": 0.0}
     stop_flag = threading.Event()
 
     def capture_loop():
@@ -134,6 +144,7 @@ def run():
             latest_yolo["fid"] = item.fid
             latest_yolo["dets"] = dets
             latest_yolo["latency"] = latency
+            latest_yolo["timestamp"] = item.timestamp
 
     def face_loop():
         while not stop_flag.is_set():
@@ -147,6 +158,7 @@ def run():
             latest_face["fid"] = item.fid
             latest_face["dets"] = dets
             latest_face["latency"] = latency
+            latest_face["timestamp"] = item.timestamp
 
     def compose_loop():
         n = 0
@@ -158,13 +170,21 @@ def run():
                 continue
             frame = item.img
             
-            # Calculate total end-to-end latency
+            # Calculate end-to-end latency of results used (age of latest outputs)
             current_time = time.time()
-            total_latency = current_time - item.timestamp
+            yolo_age = current_time - latest_yolo["timestamp"] if latest_yolo["timestamp"] > 0 else 0.0
+            face_age = current_time - latest_face["timestamp"] if latest_face["timestamp"] > 0 else 0.0
+            e2e_latency = max(yolo_age, face_age)
             
             # Use most recent results (asynchronous). It's okay if fids don't match exactly.
-            frame = draw_overlays(frame, latest_yolo["dets"], latest_face["dets"], 
-                                latest_yolo["latency"], latest_face["latency"], total_latency)
+            frame = draw_overlays(
+                frame,
+                latest_yolo["dets"],
+                latest_face["dets"],
+                latest_yolo["latency"],
+                latest_face["latency"],
+                e2e_latency,
+            )
 
             if writer:
                 writer.write(frame)
@@ -181,7 +201,7 @@ def run():
                 df = item.fid - latest_face["fid"]
                 yolo_lat_ms = latest_yolo["latency"] * 1000
                 face_lat_ms = latest_face["latency"] * 1000
-                total_lat_ms = total_latency * 1000
+                total_lat_ms = e2e_latency * 1000
                 print(f"[{n:6d}] FPS={fps:5.1f} | lag(yolo={dy}, face={df}) | latency(yolo={yolo_lat_ms:.1f}ms, face={face_lat_ms:.1f}ms, total={total_lat_ms:.1f}ms)", file=sys.stderr)
 
     th_cap = threading.Thread(target=capture_loop, daemon=True)
