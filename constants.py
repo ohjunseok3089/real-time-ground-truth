@@ -2,7 +2,7 @@ import os
 
 VIDEO_DEVICE = "/dev/video10"
 USE_GPU = True
-YOLO_MODEL = "yolov11n.pt"
+YOLO_MODEL = "yolo11n.pt"
 SHOW_WINDOW = bool(os.getenv("SHOW_WINDOW", "False")) # ssh env is auto-disable
 DRAW_YOLO = True
 DRAW_FACE = True
